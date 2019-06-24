@@ -18,150 +18,8 @@ from flask import abort
 from flask import current_app
 from flask import request
 from flask.views import MethodView
-from .constants import OPTIONAL_FIELDS
-from .marshmallow_apispec import SwaggerView
-from .marshmallow_apispec import convert_schemas
-
-
-def merge_specs(target, source):
-    """
-    Update target dictionary with values from the source, recursively.
-    List items will be merged.
-    """
-
-    for key, value in source.items():
-        if isinstance(value, dict):
-            node = target.setdefault(key, {})
-            merge_specs(node, value)
-        elif isinstance(value, list):
-            node = target.setdefault(key, [])
-            node.extend(value)
-        else:
-            target[key] = value
-
-
-def get_schema_specs(schema_id, swagger):
-    ignore_verbs = set(
-        swagger.config.get('ignore_verbs', ("HEAD", "OPTIONS")))
-
-    # technically only responses is non-optional
-    optional_fields \
-        = swagger.config.get('optional_fields') or OPTIONAL_FIELDS
-
-    with swagger.app.app_context():
-        specs = get_specs(
-            current_app.url_map.iter_rules(), ignore_verbs,
-            optional_fields, swagger.sanitizer)
-
-        swags = (swag for _, verbs in specs for _, swag in verbs
-                 if swag is not None)
-
-    for swag in swags:
-        for d in swag.get('parameters', []):
-            d_schema_id = d.get('schema', {}).get('id')
-            if d_schema_id is not None \
-                    and d_schema_id.lower() == schema_id.lower():
-                return swag
-
-
-def get_specs(rules, ignore_verbs, optional_fields, sanitizer, doc_dir=None):
-
-    specs = []
-    for rule in rules:
-        endpoint = current_app.view_functions[rule.endpoint]
-        methods = dict()
-        is_mv = is_valid_method_view(endpoint)
-
-        for verb in rule.methods.difference(ignore_verbs):
-            if not is_mv and has_valid_dispatch_view_docs(endpoint):
-                endpoint.methods = endpoint.methods or ['GET']
-                if verb in endpoint.methods:
-                    methods[verb.lower()] = endpoint
-            elif getattr(endpoint, 'methods', None) is not None:
-                if verb in endpoint.methods:
-                    verb = verb.lower()
-                    methods[verb] = getattr(endpoint.view_class, verb)
-            else:
-                methods[verb.lower()] = endpoint
-
-        verbs = []
-        for verb, method in methods.items():
-
-            klass = method.__dict__.get('view_class', None)
-            if not is_mv and klass and hasattr(klass, 'verb'):
-                method = getattr(klass, 'verb', None)
-            elif klass and hasattr(klass, 'dispatch_request'):
-                method = getattr(klass, 'dispatch_request', None)
-            if method is None:  # for MethodView
-                method = getattr(klass, verb, None)
-
-            if method is None:
-                if is_mv:  # #76 Empty MethodViews
-                    continue
-                raise RuntimeError(
-                    'Cannot detect view_func for rule {0}'.format(rule)
-                )
-
-            swag = {}
-            swagged = False
-
-            if getattr(method, 'specs_dict', None):
-                merge_specs(swag, deepcopy(method.specs_dict))
-                swagged = True
-
-            view_class = getattr(endpoint, 'view_class', None)
-            if view_class and issubclass(view_class, SwaggerView):
-                apispec_swag = {}
-                apispec_attrs = optional_fields + [
-                    'parameters', 'definitions', 'responses',
-                    'summary', 'description'
-                ]
-                for attr in apispec_attrs:
-                    value = getattr(view_class, attr)
-                    if value:
-                        apispec_swag[attr] = value
-
-                apispec_definitions = apispec_swag.get('definitions', {})
-                swag.update(
-                    convert_schemas(apispec_swag, apispec_definitions)
-                )
-                swag['definitions'] = apispec_definitions
-
-                swagged = True
-
-            if doc_dir:
-                if view_class:
-                    file_path = os.path.join(
-                        doc_dir, endpoint.__name__, method.__name__ + '.yml')
-                else:
-                    file_path = os.path.join(
-                        doc_dir, endpoint.__name__ + '.yml')
-                if os.path.isfile(file_path):
-                    func = method.__func__ \
-                        if hasattr(method, '__func__') else method
-                    setattr(func, 'swag_type', 'yml')
-                    setattr(func, 'swag_path', file_path)
-
-            doc_summary, doc_description, doc_swag = parse_docstring(
-                method, sanitizer, endpoint=rule.endpoint, verb=verb)
-
-            if doc_swag:
-                merge_specs(swag, doc_swag)
-                swagged = True
-
-            if swagged:
-                if doc_summary:
-                    swag['summary'] = doc_summary
-
-                if doc_description:
-                    swag['description'] = doc_description
-
-                verbs.append((verb, swag))
-
-        if verbs:
-            specs.append((rule, verbs))
-
-    return specs
+import sys
+import os
 
 
 def swag_from(
@@ -334,7 +192,6 @@ def validate(
                 if schema_id:
                     schema_id = schema_id.split('/')[-1]
                     break  # consider only the first
-
     if schema_id is None:
         # if it is still none use first raw_definition extracted
         if raw_definitions:
@@ -359,6 +216,15 @@ def validate(
     if validation_function is None:
         validation_function = jsonschema.validate
 
+    if '$ref' in main_def:
+        file_ref_path = os.path.dirname(sys.argv[0])+main_def['$ref']
+        with open(file_ref_path) as file:
+            file_content = file.read()
+            comment_index = file_content.index('---')+3
+            main_def = yaml.safe_load(
+                (file_content[comment_index:]).replace('\n', '\n  '))
+            main_def['definitions'] = definitions
+
     try:
         validation_function(data, main_def)
     except Exception as err:
@@ -378,6 +244,7 @@ def apispec_to_template(app, spec, definitions=None, paths=None):
     """
     definitions = definitions or []
     paths = paths or []
+    spec_dict = spec.to_dict()
 
     with app.app_context():
         for definition in definitions:
@@ -387,12 +254,11 @@ def apispec_to_template(app, spec, definitions=None, paths=None):
                 schema = definition
                 name = schema.__name__.replace('Schema', '')
 
-            spec.components.schema(name, schema=schema)
+            spec.definition(name, schema=schema)
 
         for path in paths:
-            spec.path(view=path)
+            spec.add_path(view=path)
 
-    spec_dict = spec.to_dict()
     ret = ordered_dict_to_dict(spec_dict)
     return ret
 
@@ -808,6 +674,7 @@ class LazyString(StringLike):
     A lazy string *without* caching. The resulting string is regenerated for
     every request.
     """
+
     def __init__(self, func):
         """
         Creates a `LazyString` object using `func` as the delayed closure.
@@ -826,6 +693,7 @@ class CachedLazyString(LazyString):
     """
     A lazy string with caching.
     """
+
     def __init__(self, func):
         """
         Uses `__init__()` from the parent and initializes a cache.
