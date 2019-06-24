@@ -21,6 +21,8 @@ from flask.views import MethodView
 from .constants import OPTIONAL_FIELDS
 from .marshmallow_apispec import SwaggerView
 from .marshmallow_apispec import convert_schemas
+import sys
+import os
 
 
 def merge_specs(target, source):
@@ -314,7 +316,7 @@ def validate(
             final_filepath = filepath
         full_doc = load_from_file(final_filepath)
         yaml_start = full_doc.find('---')
-        swag = yaml.safe_load(full_doc[yaml_start if yaml_start >= 0 else 0:])
+        swag = yaml.load(full_doc[yaml_start if yaml_start >= 0 else 0:])
     else:
         swag = copy.deepcopy(specs)
 
@@ -334,7 +336,6 @@ def validate(
                 if schema_id:
                     schema_id = schema_id.split('/')[-1]
                     break  # consider only the first
-
     if schema_id is None:
         # if it is still none use first raw_definition extracted
         if raw_definitions:
@@ -359,6 +360,17 @@ def validate(
     if validation_function is None:
         validation_function = jsonschema.validate
 
+    if '$ref' in main_def:
+        file_ref_path = os.path.dirname(sys.argv[0])+main_def['$ref']
+        with open(file_ref_path) as file:
+            file_content = file.read()
+            comment_index = file_content.index('---')+3
+            print('to_validate:' +
+                  (file_content[comment_index:]).replace('\n', '\n  '))
+            main_def = yaml.load(
+                (file_content[comment_index:]).replace('\n', '\n  '), Loader=yaml.FullLoader)
+            main_def['definitions'] = definitions
+
     try:
         validation_function(data, main_def)
     except Exception as err:
@@ -378,6 +390,7 @@ def apispec_to_template(app, spec, definitions=None, paths=None):
     """
     definitions = definitions or []
     paths = paths or []
+    spec_dict = spec.to_dict()
 
     with app.app_context():
         for definition in definitions:
@@ -387,12 +400,11 @@ def apispec_to_template(app, spec, definitions=None, paths=None):
                 schema = definition
                 name = schema.__name__.replace('Schema', '')
 
-            spec.components.schema(name, schema=schema)
+            spec.definition(name, schema=schema)
 
         for path in paths:
-            spec.path(view=path)
+            spec.add_path(view=path)
 
-    spec_dict = spec.to_dict()
     ret = ordered_dict_to_dict(spec_dict)
     return ret
 
@@ -553,10 +565,10 @@ def parse_docstring(obj, process_doc, endpoint=None, verb=None):
                 other_lines = process_doc(
                     full_doc[line_feed + 1: yaml_sep]
                 )
-                swag = yaml.safe_load(full_doc[yaml_sep + 4:])
+                swag = yaml.load(full_doc[yaml_sep + 4:])
         else:
             if from_file:
-                swag = yaml.safe_load(full_doc)
+                swag = yaml.load(full_doc)
             else:
                 first_line = full_doc
 
@@ -606,7 +618,7 @@ def parse_definition_docstring(obj, process_doc):
             doc_lines = process_doc(
                 full_doc[:yaml_sep - 1]
             )
-            swag = yaml.safe_load(full_doc[yaml_sep:])
+            swag = yaml.load(full_doc[yaml_sep:])
         else:
             doc_lines = process_doc(full_doc)
 
@@ -808,6 +820,7 @@ class LazyString(StringLike):
     A lazy string *without* caching. The resulting string is regenerated for
     every request.
     """
+
     def __init__(self, func):
         """
         Creates a `LazyString` object using `func` as the delayed closure.
@@ -826,6 +839,7 @@ class CachedLazyString(LazyString):
     """
     A lazy string with caching.
     """
+
     def __init__(self, func):
         """
         Uses `__init__()` from the parent and initializes a cache.
